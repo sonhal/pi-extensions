@@ -25,8 +25,12 @@ export interface RalphTask {
 	index: number;
 	/** Task title text */
 	title: string;
+	/** Short description of what needs to be done and why */
+	description: string;
 	/** Acceptance criteria (what "done" looks like) */
 	acceptance: string;
+	/** Most important file paths relevant to this task */
+	files: string[];
 	/** Whether the checkbox is checked [x] */
 	done: boolean;
 	/** Raw line for reference */
@@ -75,8 +79,10 @@ export function parsePlan(content: string): RalphTask[] {
 		autoIndex++;
 		const index = explicitIndex ?? autoIndex;
 
-		// Look ahead for metadata on the next lines (Acceptance, Agent, Group)
+		// Look ahead for metadata on the next lines (Description, Acceptance, Files, Agent)
+		let description = "";
 		let acceptance = "";
+		let files: string[] = [];
 		let agent: string | undefined;
 		for (let j = i + 1; j < lines.length; j++) {
 			const nextLine = lines[j];
@@ -87,14 +93,23 @@ export function parsePlan(content: string): RalphTask[] {
 			// Also stop if we hit a non-indented non-empty line
 			if (!nextLine.startsWith("  ") && !nextLine.startsWith("\t")) break;
 
+			const descMatch = nextLine.match(/^\s+-\s+Description:\s*(.+)/i);
+			if (descMatch) { description = descMatch[1].trim(); continue; }
+
 			const accMatch = nextLine.match(/^\s+-\s+Acceptance:\s*(.+)/i);
 			if (accMatch) { acceptance = accMatch[1].trim(); continue; }
+
+			const filesMatch = nextLine.match(/^\s+-\s+Files:\s*(.+)/i);
+			if (filesMatch) {
+				files = filesMatch[1].split(",").map(f => f.trim()).filter(Boolean);
+				continue;
+			}
 
 			const agentMatch = nextLine.match(/^\s+-\s+Agent:\s*(.+)/i);
 			if (agentMatch) { agent = agentMatch[1].trim(); continue; }
 		}
 
-		tasks.push({ index, title, acceptance, done, raw: line, agent });
+		tasks.push({ index, title, description, acceptance, files, done, raw: line, agent });
 	}
 
 	return tasks;
@@ -125,7 +140,9 @@ export function serializeTask(task: RalphTask): string {
 	const checkbox = task.done ? "[x]" : "[ ]";
 	const line = `- ${checkbox} ${task.index}. ${task.title}`;
 	const meta: string[] = [];
+	if (task.description) meta.push(`  - Description: ${task.description}`);
 	if (task.acceptance) meta.push(`  - Acceptance: ${task.acceptance}`);
+	if (task.files.length > 0) meta.push(`  - Files: ${task.files.join(", ")}`);
 	if (task.agent) meta.push(`  - Agent: ${task.agent}`);
 	return meta.length > 0 ? `${line}\n${meta.join("\n")}` : line;
 }

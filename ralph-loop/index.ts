@@ -192,14 +192,16 @@ function cleanupTempDir(tmpDir: string | null): void {
 
 function buildTaskPrompt(task: RalphTask, planContent: string, iteration: number, totalTasks: number, retry: number, maxRetries: number): string {
 	const retryStr = retry > 0 ? `, Retry ${retry}/${maxRetries}` : "";
+	const descLine = task.description ? `\nDescription: ${task.description}` : "";
+	const filesLine = task.files.length > 0 ? `\nKey Files: ${task.files.join(", ")}` : "";
 	return `[RALPH LOOP - Iteration ${iteration}, Task ${task.index}/${totalTasks}${retryStr}]
 
 ## Your Plan
 ${planContent}
 
 ## Current Task
-Task ${task.index}: ${task.title}
-Acceptance: ${task.acceptance}
+Task ${task.index}: ${task.title}${descLine}
+Acceptance: ${task.acceptance}${filesLine}
 
 ## Instructions
 1. Work ONLY on the current task above.
@@ -513,14 +515,20 @@ Write it to \`.ralph/plan.md\` using this exact format:
 
 ## Tasks
 - [ ] 1. <task title>
+  - Description: <what needs to be done and why — 1-2 sentences>
   - Acceptance: <what "done" looks like>
+  - Files: <comma-separated list of the most important files for this task>
 - [ ] 2. <task title>
+  - Description: <description>
   - Acceptance: <criteria>
+  - Files: <file paths>
 (add as many tasks as needed)
 
 ## Standards
 <testing requirements, code patterns, rules from our discussion>
 \`\`\`
+
+For the Files field: list only the files most relevant to completing the task — existing files to modify and new files to create. Use relative paths from the project root.
 
 Create the \`.ralph/\` directory first if it doesn't exist. Write the complete plan — don't leave placeholders.`);
 	}
