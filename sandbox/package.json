@@ -1,0 +1,20 @@
+{
+	"name": "pi-extension-sandbox",
+	"private": true,
+	"version": "1.5.5",
+	"type": "module",
+	"scripts": {
+		"clean": "echo 'nothing to clean'",
+		"build": "echo 'nothing to build'",
+		"check": "echo 'nothing to check'"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"@anthropic-ai/sandbox-runtime": "^0.0.52",
+		"@earendil-works/pi-coding-agent": "^0.75.5"
+	}
+}
