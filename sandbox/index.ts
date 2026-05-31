@@ -80,6 +80,8 @@ const DEFAULT_CONFIG: SandboxConfig = {
 			"*.github.com",
 			"api.github.com",
 			"raw.githubusercontent.com",
+			"proxy.golang.org",
+			"sum.golang.org",
 		],
 		deniedDomains: [],
 	},
@@ -260,12 +262,20 @@ function stopAdbBridge() {
  * If the ADB bridge is active, every command gets ADB_SERVER_SOCKET injected
  * so `adb` commands reach the host ADB server through the bridged Unix socket.
  */
-function createSandboxedBashOps(): BashOperations {
+function createSandboxedBashOps(projectRoot: string): BashOperations {
 	return {
 		async exec(command, cwd, { onData, signal, timeout, env }) {
 			if (!existsSync(cwd)) {
 				throw new Error(`Working directory does not exist: ${cwd}`);
 			}
+
+			// Redirect tool caches that default to $HOME (read-only in the
+			// sandbox) into the project tree, which is writable via allowWrite
+			// "." — so `go build` etc. don't fail with "read-only file system".
+			// Only set when the user hasn't already overridden them.
+			const cacheEnv: NodeJS.ProcessEnv = {};
+			if (!env?.GOCACHE) cacheEnv.GOCACHE = join(projectRoot, ".cache", "go-build");
+			if (!env?.GOMODCACHE) cacheEnv.GOMODCACHE = join(projectRoot, ".cache", "go-mod");
 
 			// Inject ADB_SERVER_SOCKET so `adb` connects to the host's ADB server.
 			// The Arch/Debian adb binary (android-tools) only supports the
@@ -274,7 +284,7 @@ function createSandboxedBashOps(): BashOperations {
 			//   2. Set ADB_SERVER_SOCKET=tcp:localhost:5037 via spawn env
 			// Both run inside bwrap's fresh netns where port 5037 is always free.
 			let finalCommand = command;
-			const spawnEnv: NodeJS.ProcessEnv = { ...env };
+			const spawnEnv: NodeJS.ProcessEnv = { ...cacheEnv, ...env };
 			if (adbBridge && existsSync(adbBridge.socketPath)) {
 				// Start a TCP→Unix bridge on port 5037 (inside the sandbox).
 				// The socat will be cleaned up when bwrap exits. Brief sleep
@@ -380,7 +390,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const sandboxedBash = createBashTool(localCwd, {
-				operations: createSandboxedBashOps(),
+				operations: createSandboxedBashOps(localCwd),
 			});
 			return sandboxedBash.execute(id, params, signal, onUpdate);
 		},
@@ -388,7 +398,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("user_bash", () => {
 		if (!sandboxEnabled || !sandboxInitialized) return;
-		return { operations: createSandboxedBashOps() };
+		return { operations: createSandboxedBashOps(localCwd) };
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
