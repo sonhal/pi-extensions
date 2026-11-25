@@ -1,7 +1,7 @@
 {
 	"name": "pi-extension-sandbox",
 	"private": true,
-	"version": "1.5.5",
+	"version": "2.0.0",
 	"type": "module",
 	"scripts": {
 		"clean": "echo 'nothing to clean'",
@@ -14,7 +14,6 @@
 		]
 	},
 	"dependencies": {
-		"@anthropic-ai/sandbox-runtime": "^0.0.52",
-		"@earendil-works/pi-coding-agent": "^0.75.5"
+		"@anthropic-ai/sandbox-runtime": "0.0.83"
 	}
 }

@@ -3,11 +3,13 @@
  *
  * Uses @anthropic-ai/sandbox-runtime to enforce filesystem and network
  * restrictions on bash commands at the OS level (sandbox-exec on macOS,
- * bubblewrap on Linux).
+ * bubblewrap + seccomp on Linux). pi's own file tools (read, write, edit,
+ * grep, find, ls) run outside that sandbox, so a `tool_call` guard applies the
+ * same filesystem policy to them (see path-guard.ts).
  *
- * Note: this example intentionally overrides the built-in `bash` tool to show
- * how built-in tools can be replaced. Alternatively, you could sandbox `bash`
- * via `tool_call` input mutation without replacing the tool.
+ * Fails closed: if the sandbox is enabled but cannot be initialized, bash and
+ * `!` commands are refused until the problem is fixed or pi is restarted with
+ * `--no-sandbox`.
  *
  * Config files (merged, project takes precedence):
  * - ~/.pi/agent/extensions/sandbox.json (global)
@@ -32,6 +34,13 @@
  *   }
  * }
  * ```
+ * Any other sandbox-runtime option (e.g. `allowNestedUserNamespaces`,
+ * `ignoreViolations`, `enableWeakerNestedSandbox`) is passed through as-is.
+ *
+ * Linux caveat: bubblewrap only applies allowWrite/denyWrite entries that are
+ * literal paths. Glob entries such as `*.pem` are skipped for bash (pi's own
+ * write/edit tools still honour them via the guard). `/sandbox` lists the
+ * affected entries.
  *
  * Usage:
  * - `pi -e ./sandbox` - sandbox enabled with default/config settings
@@ -42,17 +51,19 @@
  * 1. Copy sandbox/ directory to ~/.pi/agent/extensions/
  * 2. Run `npm install` in ~/.pi/agent/extensions/sandbox/
  *
- * Linux also requires: bubblewrap, socat, ripgrep
+ * Linux also requires: bubblewrap (>= 0.8.0, not setuid), socat, ripgrep
  */
 
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type BashOperations, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { GUARDED_TOOLS, PathGuard } from "./path-guard.js";
 
 interface AdbConfig {
 	/** Enable the ADB bridge to expose the host ADB server inside the sandbox */
@@ -61,10 +72,10 @@ interface AdbConfig {
 	port?: number;
 }
 
-interface SandboxConfig extends SandboxRuntimeConfig {
+type SandboxConfig = Partial<SandboxRuntimeConfig> & {
 	enabled?: boolean;
 	adb?: AdbConfig;
-}
+};
 
 const DEFAULT_CONFIG: SandboxConfig = {
 	enabled: true,
@@ -96,59 +107,34 @@ const DEFAULT_CONFIG: SandboxConfig = {
 	},
 };
 
-function loadConfig(cwd: string): SandboxConfig {
-	const projectConfigPath = join(cwd, ".pi", "sandbox.json");
-	const globalConfigPath = join(getAgentDir(), "extensions", "sandbox.json");
-
-	let globalConfig: Partial<SandboxConfig> = {};
-	let projectConfig: Partial<SandboxConfig> = {};
-
-	if (existsSync(globalConfigPath)) {
-		try {
-			globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
-		} catch (e) {
-			console.error(`Warning: Could not parse ${globalConfigPath}: ${e}`);
-		}
+function readJson(path: string): Partial<SandboxConfig> {
+	if (!existsSync(path)) return {};
+	try {
+		return JSON.parse(readFileSync(path, "utf-8"));
+	} catch (e) {
+		// A broken config must not silently weaken the sandbox.
+		throw new Error(`Could not parse ${path}: ${e instanceof Error ? e.message : e}`);
 	}
-
-	if (existsSync(projectConfigPath)) {
-		try {
-			projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
-		} catch (e) {
-			console.error(`Warning: Could not parse ${projectConfigPath}: ${e}`);
-		}
-	}
-
-	return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
 }
 
-function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
-	const result: SandboxConfig = { ...base };
+function loadConfig(cwd: string): SandboxConfig {
+	const globalConfig = readJson(join(getAgentDir(), "extensions", "sandbox.json"));
+	const projectConfig = readJson(join(cwd, ".pi", "sandbox.json"));
+	return mergeConfig(mergeConfig(DEFAULT_CONFIG, globalConfig), projectConfig);
+}
 
-	if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
-	if (overrides.network) {
-		result.network = { ...base.network, ...overrides.network };
-	}
+/**
+ * Top-level keys are replaced; `network`, `filesystem` and `adb` are merged
+ * one level deep (so a project can replace `allowWrite` without restating
+ * `network`). Arrays are replaced, not concatenated.
+ */
+function mergeConfig(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
+	const result: SandboxConfig = { ...base, ...overrides };
+	if (overrides.network) result.network = { ...base.network, ...overrides.network } as SandboxConfig["network"];
 	if (overrides.filesystem) {
-		result.filesystem = { ...base.filesystem, ...overrides.filesystem };
+		result.filesystem = { ...base.filesystem, ...overrides.filesystem } as SandboxConfig["filesystem"];
 	}
-	if (overrides.adb) {
-		result.adb = { ...base.adb, ...overrides.adb };
-	}
-
-	const extOverrides = overrides as {
-		ignoreViolations?: Record<string, string[]>;
-		enableWeakerNestedSandbox?: boolean;
-	};
-	const extResult = result as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
-
-	if (extOverrides.ignoreViolations) {
-		extResult.ignoreViolations = extOverrides.ignoreViolations;
-	}
-	if (extOverrides.enableWeakerNestedSandbox !== undefined) {
-		extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
-	}
-
+	if (overrides.adb) result.adb = { ...base.adb, ...overrides.adb };
 	return result;
 }
 
@@ -169,69 +155,62 @@ let adbBridge: AdbBridge | undefined;
  * Start the host-side ADB bridge: a socat process that creates a Unix
  * socket and forwards connections to the host's ADB server (tcp:localhost:5037).
  *
- * Returns the bridge state, or undefined if socat is not available.
+ * Returns the bridge state, or undefined if socat failed to start.
  */
-function startAdbBridge(adbPort: number): AdbBridge | undefined {
-	const socatPath = "socat";
-
-	// socat is a required sandbox dependency on Linux — skip the version
-	// check and rely on the spawn error handler instead.
-
+async function startAdbBridge(adbPort: number): Promise<AdbBridge | undefined> {
 	const socketPath = join(tmpdir(), `adb-bridge-${randomBytes(4).toString("hex")}.sock`);
 
 	// Remove any stale socket from a previous run
-	try { unlinkSync(socketPath); } catch { /* didn't exist */ }
+	try {
+		unlinkSync(socketPath);
+	} catch {
+		/* didn't exist */
+	}
 
-	const proc = spawn(socatPath, [
-		`UNIX-LISTEN:${socketPath},fork,reuseaddr`,
-		`TCP:localhost:${adbPort}`,
-	], {
+	const proc = spawn("socat", [`UNIX-LISTEN:${socketPath},fork,reuseaddr`, `TCP:localhost:${adbPort}`], {
 		stdio: "ignore",
 		detached: false,
 	});
 
-	let spawnFailed = false;
+	let spawnError: Error | undefined;
 	proc.on("error", (err) => {
-		spawnFailed = true;
-		console.error(`[sandbox] ADB bridge: spawn failed — ${err.message}`);
+		spawnError = err;
 	});
 
-	// Poll for the socket file to appear (up to 5 seconds).
-	// Use a spin-wait with fs.existsSync rather than spawnSync("sleep")
-	// so we don't block the event loop — that way proc error/exit handlers
-	// can fire and update proc.exitCode.
+	// Poll for the socket file (up to 5 seconds). Awaiting between checks lets
+	// the event loop deliver socat's `error`/`exit` events, so an early failure
+	// is noticed immediately instead of after the timeout.
 	const deadline = Date.now() + 5000;
 	while (Date.now() < deadline) {
-		if (spawnFailed || proc.exitCode !== null || proc.killed) {
+		if (spawnError || proc.exitCode !== null || proc.signalCode !== null) {
 			console.error(
-				"[sandbox] ADB bridge: socat exited early (code=" +
-					proc.exitCode +
-					", signal=" +
-					proc.signalCode +
-					")",
+				`[sandbox] ADB bridge: socat failed (${spawnError?.message ?? `code=${proc.exitCode}, signal=${proc.signalCode}`})`,
 			);
-			try { unlinkSync(socketPath); } catch { /* ignore */ }
+			removeSocket(socketPath);
 			return undefined;
 		}
 		if (existsSync(socketPath)) {
-			console.error(
-				`[sandbox] ADB bridge ready: ${socketPath} -> localhost:${adbPort}`,
-			);
 			return { socketPath, process: proc };
 		}
-		// Busy-wait 50ms — let the event loop process pending callbacks
-		const waitUntil = Date.now() + 50;
-		while (Date.now() < waitUntil) {
-			// spin (Node.js processes pending I/O in between turns)
-		}
+		await sleep(50);
 	}
 
-	console.error(
-		`[sandbox] ADB bridge: timed out waiting for socket ${socketPath}`,
-	);
-	try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-	try { unlinkSync(socketPath); } catch { /* ignore */ }
+	console.error(`[sandbox] ADB bridge: timed out waiting for socket ${socketPath}`);
+	try {
+		proc.kill("SIGTERM");
+	} catch {
+		/* ignore */
+	}
+	removeSocket(socketPath);
 	return undefined;
+}
+
+function removeSocket(socketPath: string) {
+	try {
+		unlinkSync(socketPath);
+	} catch {
+		/* ignore */
+	}
 }
 
 /**
@@ -248,14 +227,32 @@ function stopAdbBridge() {
 		// Process may have already exited
 	}
 
-	try { unlinkSync(adbBridge.socketPath); } catch { /* already removed */ }
-
+	removeSocket(adbBridge.socketPath);
 	adbBridge = undefined;
 }
 
 // ---------------------------------------------------------------------------
 // Sandboxed bash ops with ADB env injection
 // ---------------------------------------------------------------------------
+
+/**
+ * Tool caches (Go) default to $HOME, which is read-only in the sandbox, so
+ * they are redirected into `<project>/.cache`. The directory gets its own
+ * `.gitignore` (`*`) so auto-committing extensions never pick it up.
+ */
+function ensureProjectCache(projectRoot: string): string {
+	const cacheDir = join(projectRoot, ".cache");
+	const ignoreFile = join(cacheDir, ".gitignore");
+	if (!existsSync(ignoreFile)) {
+		try {
+			mkdirSync(cacheDir, { recursive: true });
+			writeFileSync(ignoreFile, "# Created by the pi sandbox extension: tool caches, never commit.\n*\n");
+		} catch {
+			// Best effort: the cache still works without the ignore file.
+		}
+	}
+	return cacheDir;
+}
 
 /**
  * Create BashOperations that wrap commands with the sandbox.
@@ -269,13 +266,12 @@ function createSandboxedBashOps(projectRoot: string): BashOperations {
 				throw new Error(`Working directory does not exist: ${cwd}`);
 			}
 
-			// Redirect tool caches that default to $HOME (read-only in the
-			// sandbox) into the project tree, which is writable via allowWrite
-			// "." — so `go build` etc. don't fail with "read-only file system".
-			// Only set when the user hasn't already overridden them.
 			const cacheEnv: NodeJS.ProcessEnv = {};
-			if (!env?.GOCACHE) cacheEnv.GOCACHE = join(projectRoot, ".cache", "go-build");
-			if (!env?.GOMODCACHE) cacheEnv.GOMODCACHE = join(projectRoot, ".cache", "go-mod");
+			if (!env?.GOCACHE || !env?.GOMODCACHE) {
+				const cacheDir = ensureProjectCache(projectRoot);
+				if (!env?.GOCACHE) cacheEnv.GOCACHE = join(cacheDir, "go-build");
+				if (!env?.GOMODCACHE) cacheEnv.GOMODCACHE = join(cacheDir, "go-mod");
+			}
 
 			// Inject ADB_SERVER_SOCKET so `adb` connects to the host's ADB server.
 			// The Arch/Debian adb binary (android-tools) only supports the
@@ -286,19 +282,14 @@ function createSandboxedBashOps(projectRoot: string): BashOperations {
 			let finalCommand = command;
 			const spawnEnv: NodeJS.ProcessEnv = { ...cacheEnv, ...env };
 			if (adbBridge && existsSync(adbBridge.socketPath)) {
-				// Start a TCP→Unix bridge on port 5037 (inside the sandbox).
-				// The socat will be cleaned up when bwrap exits. Brief sleep
-				// avoids a race between socat binding and adb connecting.
+				// The socat is cleaned up when bwrap exits. The brief sleep avoids a
+				// race between socat binding and adb connecting.
 				finalCommand =
 					`socat TCP-LISTEN:5037,fork,reuseaddr UNIX-CONNECT:${adbBridge.socketPath} &>/dev/null & ` +
 					`sleep 0.1; ${command}`;
-				// Set via spawn env so it propagates through bwrap into the
-				// sandbox — inherited by all commands without shell quoting issues.
 				spawnEnv.ADB_SERVER_SOCKET = "tcp:localhost:5037";
 			} else if (adbBridge) {
-				console.error(
-					"[sandbox] ADB bridge socket missing: " + adbBridge.socketPath,
-				);
+				console.error(`[sandbox] ADB bridge socket missing: ${adbBridge.socketPath}`);
 			}
 
 			const wrappedCommand = await SandboxManager.wrapWithSandbox(finalCommand);
@@ -314,16 +305,20 @@ function createSandboxedBashOps(projectRoot: string): BashOperations {
 				let timedOut = false;
 				let timeoutHandle: NodeJS.Timeout | undefined;
 
+				const killTree = () => {
+					if (child.pid) {
+						try {
+							process.kill(-child.pid, "SIGKILL");
+						} catch {
+							child.kill("SIGKILL");
+						}
+					}
+				};
+
 				if (timeout !== undefined && timeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
-						if (child.pid) {
-							try {
-								process.kill(-child.pid, "SIGKILL");
-							} catch {
-								child.kill("SIGKILL");
-							}
-						}
+						killTree();
 					}, timeout * 1000);
 				}
 
@@ -335,21 +330,11 @@ function createSandboxedBashOps(projectRoot: string): BashOperations {
 					reject(err);
 				});
 
-				const onAbort = () => {
-					if (child.pid) {
-						try {
-							process.kill(-child.pid, "SIGKILL");
-						} catch {
-							child.kill("SIGKILL");
-						}
-					}
-				};
-
-				signal?.addEventListener("abort", onAbort, { once: true });
+				signal?.addEventListener("abort", killTree, { once: true });
 
 				child.on("close", (code) => {
 					if (timeoutHandle) clearTimeout(timeoutHandle);
-					signal?.removeEventListener("abort", onAbort);
+					signal?.removeEventListener("abort", killTree);
 
 					if (signal?.aborted) {
 						reject(new Error("aborted"));
@@ -368,6 +353,12 @@ function createSandboxedBashOps(projectRoot: string): BashOperations {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+type SandboxState =
+	| { kind: "pending" }
+	| { kind: "disabled"; reason: string }
+	| { kind: "active"; config: SandboxConfig; warnings: string[] }
+	| { kind: "failed"; error: string };
+
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-sandbox", {
 		description: "Disable OS-level sandboxing for bash commands",
@@ -378,14 +369,29 @@ export default function (pi: ExtensionAPI) {
 	const localCwd = process.cwd();
 	const localBash = createBashTool(localCwd);
 
-	let sandboxEnabled = false;
-	let sandboxInitialized = false;
+	let state: SandboxState = { kind: "pending" };
+	let guard: PathGuard | undefined;
+
+	/** Error message when bash must be refused, or undefined when it may run. */
+	const refusal = (): string | undefined => {
+		if (state.kind === "failed") {
+			return (
+				`Sandbox is enabled but failed to initialize: ${state.error}\n` +
+				"Commands are refused rather than run unsandboxed. Fix the sandbox config, " +
+				'set "enabled": false in .pi/sandbox.json, or restart pi with --no-sandbox.'
+			);
+		}
+		if (state.kind === "pending") return "Sandbox is still initializing; try again in a moment.";
+		return undefined;
+	};
 
 	pi.registerTool({
 		...localBash,
 		label: "bash (sandboxed)",
 		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandboxInitialized) {
+			const refused = refusal();
+			if (refused) throw new Error(refused);
+			if (state.kind !== "active") {
 				return localBash.execute(id, params, signal, onUpdate);
 			}
 
@@ -397,87 +403,108 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("user_bash", () => {
-		if (!sandboxEnabled || !sandboxInitialized) return;
+		const refused = refusal();
+		if (refused) {
+			return { result: { output: `${refused}\n`, exitCode: 1, cancelled: false, truncated: false } };
+		}
+		if (state.kind !== "active") return;
 		return { operations: createSandboxedBashOps(localCwd) };
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		const noSandbox = pi.getFlag("no-sandbox") as boolean;
+	// pi's built-in file tools run outside the OS sandbox: apply the same
+	// filesystem policy to them here.
+	pi.on("tool_call", (event) => {
+		const access = GUARDED_TOOLS[event.toolName];
+		if (!access) return;
+		if (state.kind === "failed" || state.kind === "pending") {
+			return { block: true, reason: refusal() };
+		}
+		if (!guard) return;
+		const input = event.input as { path?: unknown };
+		const reason = guard.check(access, typeof input.path === "string" ? input.path : undefined);
+		if (reason) return { block: true, reason: `Sandbox: ${reason}` };
+	});
 
-		if (noSandbox) {
-			sandboxEnabled = false;
+	pi.on("session_start", async (_event, ctx) => {
+		// session_start fires again on /new, /resume and /reload: tear down first.
+		stopAdbBridge();
+		guard = undefined;
+		if (state.kind === "active") {
+			try {
+				await SandboxManager.reset();
+			} catch {
+				// Ignore cleanup errors
+			}
+		}
+		state = { kind: "pending" };
+
+		if (pi.getFlag("no-sandbox") as boolean) {
+			state = { kind: "disabled", reason: "--no-sandbox" };
 			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
 			return;
 		}
 
-		const config = loadConfig(ctx.cwd);
+		let config: SandboxConfig;
+		try {
+			config = loadConfig(ctx.cwd);
+		} catch (err) {
+			state = { kind: "failed", error: err instanceof Error ? err.message : String(err) };
+			ctx.ui.notify(`Sandbox config error — bash is blocked: ${state.error}`, "error");
+			return;
+		}
 
-		if (!config.enabled) {
-			sandboxEnabled = false;
+		if (config.enabled === false) {
+			state = { kind: "disabled", reason: "config" };
 			ctx.ui.notify("Sandbox disabled via config", "info");
 			return;
 		}
 
 		const platform = process.platform;
 		if (platform !== "darwin" && platform !== "linux") {
-			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+			state = { kind: "failed", error: `not supported on ${platform}` };
+			ctx.ui.notify(`Sandbox not supported on ${platform} — bash is blocked (use --no-sandbox)`, "error");
 			return;
 		}
 
+		const warnings: string[] = [];
 		try {
 			// --- ADB Bridge setup ---
-			const adbEnabled = config.adb?.enabled ?? false;
-			if (adbEnabled) {
-				const adbPort = config.adb?.port ?? 5037;
-
-				adbBridge = startAdbBridge(adbPort);
+			if (config.adb?.enabled) {
+				const adbPort = config.adb.port ?? 5037;
+				adbBridge = await startAdbBridge(adbPort);
 
 				if (adbBridge) {
-					// Inject Unix socket permissions so the sandboxed ADB client
-					// can connect to the bridged socket.
 					if (platform === "darwin") {
 						// macOS Seatbelt: allow only this specific socket path
 						const existing = config.network?.allowUnixSockets ?? [];
 						config.network = {
 							...config.network,
 							allowUnixSockets: [...existing, adbBridge.socketPath],
-						};
+						} as SandboxConfig["network"];
 					} else {
-						// Linux seccomp: path-based allowlisting isn't supported —
-						// seccomp-bpf can't inspect user-space memory for paths.
-						// We must allow ALL Unix sockets so ADB can call socket(AF_UNIX).
-						// The existing proxy socat commands run BEFORE seccomp and
-						// are unaffected. The tradeoff is that sandboxed code can
-						// create arbitrary Unix sockets, but cannot reach host
-						// sockets outside the bind-mounted filesystem.
-						config.network = {
-							...config.network,
-							allowAllUnixSockets: true,
-						};
+						// Linux: seccomp can't filter sockets by path, so all Unix
+						// sockets must be allowed. That removes the seccomp layer, and
+						// with it the seccomp-based block on creating user namespaces;
+						// sandbox-runtime then relies on bubblewrap's --disable-userns
+						// (bubblewrap >= 0.8.0, not setuid).
+						config.network = { ...config.network, allowAllUnixSockets: true } as SandboxConfig["network"];
+						warnings.push(
+							"ADB bridge on Linux sets allowAllUnixSockets, which disables the seccomp filter; " +
+								"the user-namespace escape protection then depends on bubblewrap >= 0.8.0 (not setuid).",
+						);
 					}
-
-					console.error(`[sandbox] ADB bridge active: ${adbBridge.socketPath} -> localhost:${adbPort}`);
 				} else {
-					console.error("[sandbox] ADB bridge failed to start — ADB commands will not work inside the sandbox");
+					warnings.push("ADB bridge failed to start — adb will not work inside the sandbox.");
 				}
 			}
 
 			// --- Initialize the sandbox ---
-			const configExt = config as unknown as {
-				ignoreViolations?: Record<string, string[]>;
-				enableWeakerNestedSandbox?: boolean;
-			};
+			const { enabled: _enabled, adb: _adb, ...runtimeConfig } = config;
+			await SandboxManager.initialize(runtimeConfig as SandboxRuntimeConfig);
+			if (platform === "linux") warnings.push(...SandboxManager.getLinuxGlobPatternWarnings());
 
-			await SandboxManager.initialize({
-				network: config.network,
-				filesystem: config.filesystem,
-				ignoreViolations: configExt.ignoreViolations,
-				enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
-			});
-
-			sandboxEnabled = true;
-			sandboxInitialized = true;
+			guard = new PathGuard(config.filesystem ?? {}, ctx.cwd);
+			state = { kind: "active", config, warnings };
 
 			const networkCount = config.network?.allowedDomains?.length ?? 0;
 			const writeCount = config.filesystem?.allowWrite?.length ?? 0;
@@ -486,18 +513,23 @@ export default function (pi: ExtensionAPI) {
 				"sandbox",
 				ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths${adbStatus}`),
 			);
-			ctx.ui.notify("Sandbox initialized" + (adbBridge ? " (ADB bridge active)" : ""), "info");
+			ctx.ui.notify(
+				`Sandbox initialized${adbBridge ? " (ADB bridge active)" : ""}` +
+					(warnings.length > 0 ? ` — ${warnings.length} warning(s), see /sandbox` : ""),
+				warnings.length > 0 ? "warning" : "info",
+			);
 		} catch (err) {
-			stopAdbBridge(); // clean up on failure
-			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
+			stopAdbBridge();
+			state = { kind: "failed", error: err instanceof Error ? err.message : String(err) };
+			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "🔓 Sandbox FAILED — bash blocked"));
+			ctx.ui.notify(`Sandbox initialization failed — bash is blocked: ${state.error}`, "error");
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
 		stopAdbBridge();
 
-		if (sandboxInitialized) {
+		if (state.kind === "active") {
 			try {
 				await SandboxManager.reset();
 			} catch {
@@ -509,30 +541,42 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("sandbox", {
 		description: "Show sandbox configuration",
 		handler: async (_args, ctx) => {
-			if (!sandboxEnabled) {
-				ctx.ui.notify("Sandbox is disabled", "info");
+			if (state.kind !== "active") {
+				const message =
+					state.kind === "failed"
+						? `Sandbox FAILED — bash and file tools are blocked: ${state.error}`
+						: state.kind === "disabled"
+							? `Sandbox is disabled (${state.reason})`
+							: "Sandbox is initializing";
+				ctx.ui.notify(message, state.kind === "failed" ? "error" : "info");
 				return;
 			}
 
-			const config = loadConfig(ctx.cwd);
+			const { config, warnings } = state;
+			const list = (entries: unknown[] | undefined) =>
+				entries?.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join(", ") || "(none)";
 			const lines = [
 				"Sandbox Configuration:",
 				"",
 				"Network:",
-				`  Allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-				`  Denied: ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
+				`  Allowed: ${list(config.network?.allowedDomains)}`,
+				`  Denied: ${list(config.network?.deniedDomains)}`,
 				"",
-				"Filesystem:",
-				`  Deny Read: ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
-				`  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-				`  Deny Write: ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
+				"Filesystem (bash via OS sandbox; read/write/edit/grep/find/ls via path guard):",
+				`  Deny Read: ${list(config.filesystem?.denyRead)}`,
+				`  Allow Read: ${list(config.filesystem?.allowRead)}`,
+				`  Allow Write: ${list(config.filesystem?.allowWrite)}`,
+				`  Deny Write: ${list(config.filesystem?.denyWrite)}`,
 				"",
 				"ADB Bridge:",
 				adbBridge
 					? `  Enabled — socket: ${adbBridge.socketPath} -> localhost:${config.adb?.port ?? 5037}`
-					: `  Disabled${config.adb?.enabled ? " (socat not available)" : ""}`,
+					: `  Disabled${config.adb?.enabled ? " (failed to start)" : ""}`,
 			];
-			ctx.ui.notify(lines.join("\n"), "info");
+			if (warnings.length > 0) {
+				lines.push("", "Warnings:", ...warnings.map((w) => `  ⚠ ${w}`));
+			}
+			ctx.ui.notify(lines.join("\n"), warnings.length > 0 ? "warning" : "info");
 		},
 	});
 }
